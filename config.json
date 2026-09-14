@@ -1,0 +1,10 @@
+{
+  "api_id": 2040,
+  "api_hash": "b18441a1ff607e10a989891a5462e627",
+  "app_version": "4.16.8",
+  "device_model": "Desktop",
+  "system_version": "Windows 10",
+  "lang_code": "ru",
+  "system_lang_code": "ru-RU",
+  "_comment": "Публичные api_id/api_hash официального Telegram Desktop (2040). app_version/device_model/system_version/lang_code/system_lang_code имитируют официальный Telegram Desktop. system_lang_code обязателен (pyrogram без него не передаёт его в InitConnection)."
+}

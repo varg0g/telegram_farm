@@ -1,0 +1,49 @@
+# Environments
+venv/
+env/
+.env
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Telegram Farm Private Data & Sessions (CRITICAL)
+sessions/
+*.session
+*.session-journal
+*.session.bak
+*.profile.json
+
+# SQLite Databases & Journals
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite3
+
+# Logs
+*.log
+farm.log
+
+# Uploaded & Cached Media
+uploads/avatars/*
+!uploads/avatars/.gitkeep
+uploads/leomatch/*
+!uploads/leomatch/.gitkeep
+data/avatar_cache/
+data/media_cache/
+data/cache/
+*_cache/
+
+# Temp and browser profiles
+scratch_chrome_profile/
+scratch_chrome_temp/
+scratch/
+
+# Backups & Temp
+backup_v1/
+backup_v2/
+.agents/
+.idea/
+.vscode/
