@@ -121,26 +121,38 @@ async def _download_avatar(account: str, chat_id: int) -> bool:
     fut = loop.create_future()
     _avatar_in_flight[cache_key] = fut
 
+    operation_failed = False
     try:
         async with avatar_limiter.slot(account):
             if str(chat_id) in (str(account), "0", "-1"):
                 downloaded = await asyncio.wait_for(
-                    client.download_profile_photo("me", file=str(avatar_file)), timeout=2.0
+                    client.download_profile_photo("me", file=str(avatar_file)), timeout=20.0
                 )
             else:
                 try:
-                    entity = await asyncio.wait_for(client.get_input_entity(chat_id), timeout=1.5)
+                    entity = await asyncio.wait_for(client.get_input_entity(chat_id), timeout=6.0)
                 except Exception:
                     try:
-                        entity = await asyncio.wait_for(client.get_entity(chat_id), timeout=1.5)
+                        entity = await asyncio.wait_for(client.get_entity(chat_id), timeout=6.0)
                     except Exception:
                         entity = chat_id
                 downloaded = await asyncio.wait_for(
-                    client.download_profile_photo(entity, file=str(avatar_file)), timeout=2.0
+                    client.download_profile_photo(entity, file=str(avatar_file)), timeout=20.0
                 )
+    except asyncio.CancelledError:
+        operation_failed = True
+        raise
     except Exception as e:
+        operation_failed = True
         logger.debug(f"Avatar download error for {chat_id}: {e}")
     finally:
+        # Чистим битый (недокачанный / 0-байтовый) файл, чтобы не блокировал повторный кач
+        if avatar_file.exists():
+            try:
+                if avatar_file.stat().st_size == 0:
+                    avatar_file.unlink()
+            except OSError:
+                pass
         if not fut.done():
             fut.set_result(False)
         _avatar_in_flight.pop(cache_key, None)
@@ -148,6 +160,12 @@ async def _download_avatar(account: str, chat_id: int) -> bool:
     if _avatar_on_disk(avatar_file):
         return True
 
+    # Временный сбой (таймаут/сеть/прерывание) НЕ заносим в негативный кэш — иначе
+    # аватарка «мертва» на 10 минут, хотя следующая попытка легко может пройти.
+    if operation_failed:
+        return False
+
+    # Стабильный исход: фото действительно нет / клиент недоступен — кэшируем надолго.
     _mark_avatar_negative(cache_key)
     return False
 
@@ -233,7 +251,7 @@ async def api_get_avatars_bulk(items: str = Query(""), download: int = Query(16)
         async def resolve(account: str, chat_id: int):
             async with gate:
                 try:
-                    ok = await asyncio.wait_for(_download_avatar(account, chat_id), timeout=6.0)
+                    ok = await asyncio.wait_for(_download_avatar(account, chat_id), timeout=25.0)
                 except Exception:
                     ok = False
             return account, chat_id, ok
