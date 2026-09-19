@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { api } from './api';
 import Sidebar from './components/Sidebar';
 import AccountList from './components/AccountList';
@@ -69,6 +69,64 @@ export default function App() {
   const leadCacheRef = useRef(new Map());
   const chatAbortRef = useRef(null);
 
+  // Карта аватарок: один пакетный запрос на видимое окно списка вместо
+  // отдельного HTTP-запроса от каждой строки (это и забивало соединения браузера).
+  const [avatarMap, setAvatarMap] = useState({});
+  const avatarMapRef = useRef({});
+  const avatarPendingRef = useRef(new Set());
+  const avatarRetriedRef = useRef(new Set());
+  const avatarRetryTimerRef = useRef(null);
+
+  const itemToKey = (item) => {
+    const sep = item.lastIndexOf(':');
+    return sep < 0 ? item : `${item.slice(0, sep)}_${item.slice(sep + 1)}`;
+  };
+  const keyToItem = (key) => {
+    const sep = key.lastIndexOf('_');
+    return sep < 0 ? key : `${key.slice(0, sep)}:${key.slice(sep + 1)}`;
+  };
+
+  const requestAvatars = useCallback((items) => {
+    const missing = (items || []).filter(it => {
+      const key = itemToKey(it);
+      return !(key in avatarMapRef.current) && !avatarPendingRef.current.has(key);
+    });
+    if (!missing.length) return;
+
+    missing.forEach(it => avatarPendingRef.current.add(itemToKey(it)));
+    const payload = missing.slice(0, 40).join(',');
+
+    api.getAvatars(payload, 16).then(res => {
+      const found = res?.found || {};
+      const failed = res?.failed || [];
+      const skipped = res?.skipped || [];
+
+      const next = { ...avatarMapRef.current, ...found };
+      failed.forEach(k => { next[k] = null; });
+
+      Object.keys(found).forEach(k => avatarPendingRef.current.delete(k));
+      failed.forEach(k => avatarPendingRef.current.delete(k));
+      skipped.forEach(k => avatarPendingRef.current.delete(k));
+
+      avatarMapRef.current = next;
+      setAvatarMap(next);
+
+      // Не успевшие из-за бюджета догружаем одним повтором — прогрессивно, без шторма
+      const retryItems = skipped
+        .filter(k => !avatarRetriedRef.current.has(k))
+        .map(keyToItem);
+      if (retryItems.length) {
+        retryItems.forEach(it => avatarRetriedRef.current.add(itemToKey(it)));
+        clearTimeout(avatarRetryTimerRef.current);
+        avatarRetryTimerRef.current = setTimeout(() => requestAvatars(retryItems), 1200);
+      }
+    }).catch(() => {
+      missing.forEach(it => avatarPendingRef.current.delete(itemToKey(it)));
+    });
+  }, []);
+
+  useEffect(() => () => clearTimeout(avatarRetryTimerRef.current), []);
+
   // Звуковые уведомления
   const [isSoundEnabled, setIsSoundEnabled] = useState(() => {
     return localStorage.getItem('tgfarm_sound') !== 'false';
@@ -125,6 +183,10 @@ export default function App() {
     const ws = new WebSocket(`${wsProto}//${wsHost}/ws`);
 
     ws.onmessage = (e) => {
+      // Сервер отвечает на ping обычным текстом "pong" — это транспортный
+      // heartbeat, а не JSON-событие, поэтому его нужно пропустить.
+      if (typeof e.data === 'string' && !e.data.startsWith('{')) return;
+
       try {
         const data = JSON.parse(e.data);
         
@@ -354,6 +416,16 @@ export default function App() {
     loadDialogs();
   }, [selectedAccount, selectedGroup, filterType, searchQuery]);
 
+  // Прогрев истории только для выбранного аккаунта (вместо массового прогрева
+  // всех 70+ сессий на старте бэкенда, который забивал MTProto и event loop).
+  useEffect(() => {
+    if (!selectedAccount) return undefined;
+    const timer = setTimeout(() => {
+      api.precacheAccount(selectedAccount, 20).catch(() => {});
+    }, 600);
+    return () => clearTimeout(timer);
+  }, [selectedAccount]);
+
   // 4. Открытие активного чата: история переписки и карточка лида (0 мс SWR + Instant Seed)
   useEffect(() => {
     if (!selectedDialog) {
@@ -569,6 +641,8 @@ export default function App() {
           loadInitialData();
         }}
         onRefreshDialogs={loadDialogs}
+        avatarMap={avatarMap}
+        onNeedAvatars={requestAvatars}
       />
 
       {/* 4. Колонка 3: Окно активного чата */}

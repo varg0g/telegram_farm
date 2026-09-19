@@ -3,12 +3,13 @@ import re
 import time
 import asyncio
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional, Dict, Tuple
 from fastapi import APIRouter, HTTPException, Request, Response, Query
 from fastapi.responses import FileResponse, JSONResponse
 from app.core.config import MEDIA_DIR
 from app.core.logger import logger
 from app.telegram.client_manager import client_manager
+from app.telegram.mtproto_limiter import media_limiter
 from app.db.database import db
 
 router = APIRouter(prefix="/api/media", tags=["media"])
@@ -18,7 +19,8 @@ def _sanitize(val: str) -> str:
 
 _download_locks: Dict[str, asyncio.Lock] = {}
 _media_negative_cache: Dict[str, float] = {}
-_media_semaphore = asyncio.Semaphore(2)
+_NEGATIVE_CACHE_TTL = 600.0
+_NEGATIVE_CACHE_MAX = 20000
 
 def _get_media_type_by_ext(ext: str) -> str:
     ext = ext.lower()
@@ -40,21 +42,113 @@ def _get_media_type_by_ext(ext: str) -> str:
         return "image/gif"
     return "application/octet-stream"
 
-_media_path_cache: Dict[str, Path] = {}
+# ==================== ИНДЕКС МЕДИАФАЙЛОВ ====================
+# Раньше поиск файла делался через MEDIA_DIR.glob() прямо в event loop — на каталоге
+# в десятки тысяч файлов это блокировало весь сервер на ~20 мс на каждый вызов,
+# а вызывался он до 3 раз на один медиазапрос. Теперь каталог сканируется один раз
+# на старте (в отдельном потоке), а поиск — это O(1) обращение к словарю.
+
+_media_index: Dict[str, Path] = {}                      # stem -> путь к файлу
+_media_peer_index: Dict[Tuple[int, int], Path] = {}     # (chat_id, message_id) -> путь к файлу
+_media_index_ready = False
+_media_index_lock = asyncio.Lock()
+
+
+def _parse_media_stem(stem: str) -> Optional[Tuple[int, int, bool]]:
+    """
+    Разбирает имя файла вида `{account}_{chat_id}_{message_id}[_thumb]`.
+    Возвращает (chat_id, message_id, is_thumb) либо None, если имя не по шаблону.
+    """
+    parts = stem.split("_")
+    if len(parts) < 3:
+        return None
+    if parts[-1] == "thumb":
+        if len(parts) < 4:
+            return None
+        try:
+            return int(parts[-3]), int(parts[-2]), True
+        except ValueError:
+            return None
+    try:
+        return int(parts[-2]), int(parts[-1]), False
+    except ValueError:
+        return None
+
+
+def _is_readable_file(path: Path) -> bool:
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _scan_media_dir() -> Tuple[Dict[str, Path], Dict[Tuple[int, int], Path]]:
+    """Однократный обход каталога медиа. Выполняется в отдельном потоке."""
+    index: Dict[str, Path] = {}
+    peer_index: Dict[Tuple[int, int], Path] = {}
+    try:
+        with os.scandir(MEDIA_DIR) as entries:
+            for entry in entries:
+                name = entry.name
+                if name.startswith(".") or "_" not in name:
+                    continue
+                try:
+                    if not entry.is_file():
+                        continue
+                except OSError:
+                    continue
+                stem = name.rsplit(".", 1)[0]
+                path = Path(entry.path)
+                index[stem] = path
+                parsed = _parse_media_stem(stem)
+                if parsed and not parsed[2]:
+                    peer_index.setdefault((parsed[0], parsed[1]), path)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.warning(f"Не удалось построить индекс медиа: {e}")
+    return index, peer_index
+
+
+async def ensure_media_index(force: bool = False) -> None:
+    """Гарантирует готовность индекса. Вызывается на старте приложения."""
+    global _media_index_ready
+    if _media_index_ready and not force:
+        return
+    async with _media_index_lock:
+        if _media_index_ready and not force:
+            return
+        index, peer_index = await asyncio.to_thread(_scan_media_dir)
+        _media_index.clear()
+        _media_index.update(index)
+        _media_peer_index.clear()
+        _media_peer_index.update(peer_index)
+        _media_index_ready = True
+        logger.info(f"Индекс медиа готов: {len(_media_index)} файлов в кэше")
+
 
 def register_cached_media(path: Path):
-    """Регистрирует новый файл в быстром in-memory кэше."""
-    if path and path.is_file() and path.stat().st_size > 0:
-        stem = path.stem
-        _media_path_cache[stem] = path
+    """Регистрирует новый файл в индексе (после скачивания или отправки)."""
+    if not path:
+        return
+    try:
+        if not _is_readable_file(path):
+            return
+    except OSError:
+        return
+    stem = path.stem
+    _media_index[stem] = path
+    parsed = _parse_media_stem(stem)
+    if parsed and not parsed[2]:
+        _media_peer_index.setdefault((parsed[0], parsed[1]), path)
+
 
 def find_cached_media(account_phone: str, chat_id: int, message_id: int, thumb: bool = False) -> Optional[Path]:
-    """Быстрый поиск существующего файла в локальном кэше (память < 0.001 мс, диск как fallback)."""
+    """Поиск файла в локальном кэше: только словарные обращения, без дискового I/O."""
     clean_acc = account_phone.strip().lstrip("+")
     safe_clean = _sanitize(clean_acc)
     safe_raw = _sanitize(account_phone.strip())
 
-    # 1. Проверка точного совпадения по аккаунту
     stems_to_try = []
     for prefix in [safe_clean, safe_raw]:
         if thumb:
@@ -62,31 +156,29 @@ def find_cached_media(account_phone: str, chat_id: int, message_id: int, thumb: 
         stems_to_try.append(f"{prefix}_{chat_id}_{message_id}")
 
     for stem in stems_to_try:
-        if stem in _media_path_cache:
-            p = _media_path_cache[stem]
-            if p.is_file() and p.stat().st_size > 0:
-                return p
-            else:
-                _media_path_cache.pop(stem, None)
+        cached = _media_index.get(stem)
+        if cached is None:
+            continue
+        if _is_readable_file(cached):
+            return cached
+        _media_index.pop(stem, None)
 
-        pattern = f"{stem}.*"
-        for existing in MEDIA_DIR.glob(pattern):
-            if existing.is_file() and existing.stat().st_size > 0:
-                _media_path_cache[stem] = existing
-                return existing
-
-    # 2. Fallback: поиск по chat_id и message_id независимо от аккаунта фермы
-    global_patterns = []
-    if thumb:
-        global_patterns.append(f"*_{chat_id}_{message_id}_thumb.*")
-    global_patterns.append(f"*_{chat_id}_{message_id}.*")
-    for pat in global_patterns:
-        for existing in MEDIA_DIR.glob(pat):
-            if existing.is_file() and existing.stat().st_size > 0:
-                _media_path_cache[existing.stem] = existing
-                return existing
+    # Fallback: тот же chat_id/message_id, но другое написание аккаунта
+    peer_cached = _media_peer_index.get((chat_id, message_id))
+    if peer_cached and _is_readable_file(peer_cached):
+        return peer_cached
 
     return None
+
+def _mark_negative(lock_key: str) -> None:
+    """Помечает медиа как отсутствующее, попутно подчищая разросшийся кэш."""
+    now = time.time()
+    _media_negative_cache[lock_key] = now
+    if len(_media_negative_cache) > _NEGATIVE_CACHE_MAX:
+        for key, ts in list(_media_negative_cache.items()):
+            if (now - ts) > _NEGATIVE_CACHE_TTL:
+                _media_negative_cache.pop(key, None)
+
 
 async def download_media_to_file(account_phone: str, chat_id: int, message_id: int, thumb: bool = False) -> Optional[Path]:
     """
@@ -102,7 +194,7 @@ async def download_media_to_file(account_phone: str, chat_id: int, message_id: i
     lock_key = f"{safe_clean}_{chat_id}_{message_id}{'_thumb' if thumb else ''}"
     now = time.time()
     neg_ts = _media_negative_cache.get(lock_key)
-    if neg_ts and (now - neg_ts) < 600:
+    if neg_ts and (now - neg_ts) < _NEGATIVE_CACHE_TTL:
         return None
 
     if lock_key not in _download_locks:
@@ -115,14 +207,14 @@ async def download_media_to_file(account_phone: str, chat_id: int, message_id: i
             return cached
 
         neg_ts = _media_negative_cache.get(lock_key)
-        if neg_ts and (time.time() - neg_ts) < 600:
+        if neg_ts and (time.time() - neg_ts) < _NEGATIVE_CACHE_TTL:
             return None
 
         client = client_manager.get_client(clean_acc)
         if not client or not client.is_connected():
             return None
 
-        async with _media_semaphore:
+        async with media_limiter.slot(clean_acc):
             try:
                 msg = None
                 try:
@@ -132,11 +224,11 @@ async def download_media_to_file(account_phone: str, chat_id: int, message_id: i
                         entity = await asyncio.wait_for(client.get_input_entity(chat_id), timeout=1.5)
                         msg = await asyncio.wait_for(client.get_messages(entity, ids=message_id), timeout=2.0)
                     except Exception:
-                        _media_negative_cache[lock_key] = time.time()
+                        _mark_negative(lock_key)
                         return None
 
                 if not msg or not msg.media:
-                    _media_negative_cache[lock_key] = time.time()
+                    _mark_negative(lock_key)
                     return None
 
                 if thumb:
@@ -195,10 +287,10 @@ async def download_media_to_file(account_phone: str, chat_id: int, message_id: i
                     register_cached_media(target_file)
                     return target_file
 
-                _media_negative_cache[lock_key] = time.time()
+                _mark_negative(lock_key)
             except Exception as e:
                 logger.debug(f"Media download failed {chat_id}/{message_id}: {e}")
-                _media_negative_cache[lock_key] = time.time()
+                _mark_negative(lock_key)
                 return None
 
     return None

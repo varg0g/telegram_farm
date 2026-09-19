@@ -24,11 +24,20 @@ class ClientManager:
     """
     _instance = None
 
+    SUPERVISOR_INTERVAL = 30          # период проверки живости соединений, сек
+    RECONNECT_BASE_DELAY = 5          # стартовая пауза перед повтором, сек
+    RECONNECT_MAX_DELAY = 300         # максимальная пауза между попытками, сек
+    PRECACHE_TOP_COUNT = 5            # сколько диалогов прогревать сразу после старта аккаунта
+
     def __init__(self):
         self.clients: Dict[str, TelegramClient] = {}          # identifier (phone/name) -> TelegramClient
         self.account_info: Dict[str, Dict[str, Any]] = {}     # identifier -> данные профиля Telegram
         self.pending_auths: Dict[str, Dict[str, Any]] = {}    # phone -> данные промежуточной авторизации по номеру
         self.client_locks: Dict[str, asyncio.Lock] = {}       # блокировки для предотвращения race conditions
+        self._bg_tasks: set = set()                           # сильные ссылки на фоновые задачи (защита от GC)
+        self._supervisor_task: Optional[asyncio.Task] = None
+        self._reconnect_state: Dict[str, Dict[str, float]] = {}
+        self._precache_gate = asyncio.Semaphore(1)            # прогрев идёт строго по одному аккаунту
 
     @classmethod
     def get_instance(cls):
@@ -36,54 +45,99 @@ class ClientManager:
             cls._instance = ClientManager()
         return cls._instance
 
+    def _spawn(self, coro) -> asyncio.Task:
+        """Запускает фоновую задачу, удерживая на неё ссылку до завершения."""
+        task = asyncio.create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        return task
+
     def _get_lock(self, ident: str) -> asyncio.Lock:
         if ident not in self.client_locks:
             self.client_locks[ident] = asyncio.Lock()
         return self.client_locks[ident]
 
     def get_client(self, ident: str) -> Optional[TelegramClient]:
-        """Возвращает активный подключенный клиент по номеру, имени сессии или ID."""
+        """
+        Чистый поиск клиента по номеру, имени сессии или ID.
+
+        ВАЖНО: метод не имеет побочных эффектов — он НЕ инициирует переподключение.
+        Раньше каждый вызов мог породить reconnect-задачу, а так как метод вызывается
+        для каждого аккаунта на каждый запрос списка аккаунтов и для каждой аватарки,
+        при 70+ сессиях это превращалось в шторм повторных MTProto-хендшейков.
+        Переподключением теперь занимается единственный супервизор (_supervisor_loop).
+        """
         if not ident:
             return None
         ident_str = str(ident).strip()
         clean = ident_str.lstrip("+")
-        
+
         direct = self.clients.get(clean) or self.clients.get(ident_str) or self.clients.get(f"+{clean}")
         if direct and direct.is_connected():
             return direct
-            
+
         for k, info in self.account_info.items():
             if ident_str in (info.get("phone"), info.get("username"), str(info.get("id"))) or clean in (str(info.get("phone", "")).lstrip("+"),):
                 c = self.clients.get(k)
                 if c and c.is_connected():
                     return c
-                    
-        # Если клиент найден, но соединение временно разорвано — инициируем неблокирующее авто-переподключение
-        target = direct
-        if not target:
-            for k, info in self.account_info.items():
-                if ident_str in (info.get("phone"), info.get("username"), str(info.get("id"))) or clean in (str(info.get("phone", "")).lstrip("+"),):
-                    target = self.clients.get(k)
-                    break
 
-        if target and not target.is_connected():
+        return direct
+
+    # ==================== СУПЕРВИЗОР СОЕДИНЕНИЙ ====================
+
+    async def start_supervisor(self):
+        """Запускает единственный фоновый цикл восстановления упавших соединений."""
+        if self._supervisor_task and not self._supervisor_task.done():
+            return
+        self._supervisor_task = asyncio.create_task(self._supervisor_loop())
+        logger.info("Супервизор соединений Telethon запущен.")
+
+    async def stop_supervisor(self):
+        if self._supervisor_task:
+            self._supervisor_task.cancel()
             try:
-                loop = asyncio.get_running_loop()
-                if not getattr(target, '_is_reconnecting', False):
-                    target._is_reconnecting = True
-                    async def _reconnect(c=target, name=clean):
-                        try:
-                            await c.connect()
-                            logger.info(f"[{name}] Соединение Telethon успешно восстановлено.")
-                        except Exception as rec_err:
-                            logger.debug(f"Auto-reconnect failed for {name}: {rec_err}")
-                        finally:
-                            c._is_reconnecting = False
-                    loop.create_task(_reconnect())
-            except RuntimeError:
+                await self._supervisor_task
+            except asyncio.CancelledError:
                 pass
-                    
-        return target
+            self._supervisor_task = None
+
+    async def _supervisor_loop(self):
+        while True:
+            try:
+                await asyncio.sleep(self.SUPERVISOR_INTERVAL)
+                await self._reconnect_down_clients()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug(f"Ошибка в супервизоре соединений: {e}")
+
+    async def _reconnect_down_clients(self):
+        """Переподключает только реально отключённые клиенты, с экспоненциальным backoff."""
+        now = time.time()
+        seen = set()
+        for phone, client in list(self.clients.items()):
+            if client is None or id(client) in seen:
+                continue
+            seen.add(id(client))
+
+            if client.is_connected():
+                self._reconnect_state.pop(phone, None)
+                continue
+
+            state = self._reconnect_state.get(phone) or {"attempts": 0, "next_at": 0}
+            if now < state.get("next_at", 0):
+                continue
+
+            try:
+                await asyncio.wait_for(client.connect(), timeout=25)
+                self._reconnect_state.pop(phone, None)
+                logger.info(f"[{phone}] Соединение Telethon восстановлено супервизором.")
+            except Exception as rec_err:
+                attempts = int(state.get("attempts", 0)) + 1
+                delay = min(self.RECONNECT_MAX_DELAY, self.RECONNECT_BASE_DELAY * (2 ** min(attempts, 6)))
+                self._reconnect_state[phone] = {"attempts": attempts, "next_at": now + delay}
+                logger.debug(f"Повтор подключения [{phone}] через {delay}с: {rec_err}")
 
     async def start_account(self, session_name: str, force: bool = False) -> Tuple[bool, str]:
         """
@@ -196,8 +250,12 @@ class ClientManager:
 
                 logger.info(f"Аккаунт [{phone or base_name}] успешно подключен! (@{username}, ID: {user_id})")
 
+                # Сбрасываем backoff супервизора — аккаунт поднят вручную/успешно
+                self._reconnect_state.pop(clean_phone, None)
+                self._reconnect_state.pop(clean_name, None)
+
                 # Фоновая синхронизация последних диалогов (не блокирует старт)
-                asyncio.create_task(self._sync_recent_dialogs(phone or clean_name, client))
+                self._spawn(self._sync_recent_dialogs(phone or clean_name, client))
 
                 # Рассылка статуса в веб-сокет
                 await broadcaster.broadcast({
@@ -315,75 +373,85 @@ class ClientManager:
                     account_phone, chat_id, chat_type, title, username, top_text, top_date, unread, pinned, archived, read_outbox_max_id, top_id, top_out, now
                 ))
 
-                if read_outbox_max_id > 0:
-                    clean = str(account_phone).strip().lstrip("+")
-                    await db.execute("""
-                        UPDATE messages SET is_read = 1
-                        WHERE (account_phone = ? OR account_phone = ?) AND chat_id = ? AND is_outgoing = 1 AND message_id <= ?
-                    """, (clean, f"+{clean}", chat_id, read_outbox_max_id))
-                    await db.execute("""
-                        UPDATE messages SET is_read = 0
-                        WHERE (account_phone = ? OR account_phone = ?) AND chat_id = ? AND is_outgoing = 1 AND message_id > ?
-                    """, (clean, f"+{clean}", chat_id, read_outbox_max_id))
+                # Примечание: синхронизация is_read по сообщениям здесь СОЗНАТЕЛЬНО не делается.
+                # Раньше на каждый диалог выполнялось 2 UPDATE по всей истории чата, то есть
+                # ~14 000 широких UPDATE на старте 70 аккаунтов. Состояние прочтения и так
+                # вычисляется на чтении из read_outbox_max_id (chat_service.get_chat_messages),
+                # а точечные события прочтения приходят через events.MessageRead.
             logger.info(f"[{account_phone}] Синхронизация {limit} диалогов завершена.")
-            # Запускаем мягкий фоновый прогрев истории сообщений топ-диалогов в SQLite
-            asyncio.create_task(self._precache_top_messages(account_phone, client))
+            # Мягкий фоновый прогрев истории только для топ-диалогов (под глобальным шлюзом)
+            self._spawn(self._precache_top_messages(account_phone, client, top_count=self.PRECACHE_TOP_COUNT))
         except Exception as e:
             logger.warning(f"[{account_phone}] Ошибка фоновой синхронизации диалогов: {e}")
 
-    async def _precache_top_messages(self, account_phone: str, client: TelegramClient, top_count: int = 30):
+    async def precache_account(self, ident: str, top_count: int = 20) -> bool:
+        """Прогрев истории для конкретного (выбранного в UI) аккаунта."""
+        client = self.get_client(ident)
+        if not client or not client.is_connected():
+            return False
+        clean = str(ident).strip().lstrip("+")
+        info = self.account_info.get(clean) or {}
+        phone = info.get("phone") or clean
+        self._spawn(self._precache_top_messages(phone, client, top_count=top_count))
+        return True
+
+    async def _precache_top_messages(self, account_phone: str, client: TelegramClient, top_count: int = 5):
         """
         Фоновый прогрев истории переписок для топ-диалогов в SQLite.
         Обеспечивает мгновенное открытие любого диалога за 1-2 мс (Zero Network Waiting).
+
+        Выполняется строго по одному аккаунту за раз (_precache_gate): иначе при 70+
+        сессиях на старте одновременно уходили тысячи запросов messages.getHistory.
         """
-        await asyncio.sleep(2.0)
-        try:
-            clean = str(account_phone).strip().lstrip("+")
-            rows = await db.fetch_all(
-                "SELECT chat_id, title FROM dialogs WHERE (account_phone = ? OR account_phone = ?) ORDER BY is_pinned DESC, top_message_date DESC LIMIT ?",
-                (clean, f"+{clean}", top_count)
-            )
-            for r in rows:
-                chat_id = r["chat_id"]
-                cnt_row = await db.fetch_one(
-                    "SELECT COUNT(*) as cnt FROM messages WHERE (account_phone = ? OR account_phone = ?) AND chat_id = ?",
-                    (clean, f"+{clean}", chat_id)
+        async with self._precache_gate:
+            await asyncio.sleep(2.0)
+            try:
+                clean = str(account_phone).strip().lstrip("+")
+                rows = await db.fetch_all(
+                    "SELECT chat_id, title FROM dialogs WHERE (account_phone = ? OR account_phone = ?) ORDER BY is_pinned DESC, top_message_date DESC LIMIT ?",
+                    (clean, f"+{clean}", top_count)
                 )
-                if cnt_row and cnt_row["cnt"] >= 15:
-                    continue  # Уже закэшировано
+                for r in rows:
+                    chat_id = r["chat_id"]
+                    cnt_row = await db.fetch_one(
+                        "SELECT COUNT(*) as cnt FROM messages WHERE (account_phone = ? OR account_phone = ?) AND chat_id = ?",
+                        (clean, f"+{clean}", chat_id)
+                    )
+                    if cnt_row and cnt_row["cnt"] >= 15:
+                        continue  # Уже закэшировано
 
-                if not client or not client.is_connected():
-                    break
+                    if not client or not client.is_connected():
+                        break
 
-                try:
-                    msgs = await asyncio.wait_for(client.get_messages(chat_id, limit=30), timeout=4.0)
-                    batch = []
-                    for m in msgs:
-                        from app.telegram.events_dispatcher import get_media_info, extract_buttons
-                        m_type, _, meta = get_media_info(m)
-                        btns = extract_buttons(m)
-                        m_date = int(m.date.timestamp()) if m.date else int(time.time())
-                        batch.append((
-                            clean, chat_id, m.id, m.sender_id, m.text or "", m_date,
-                            1 if m.out else 0, 1 if m.out else 0, m_type,
-                            json.dumps(meta) if meta else None,
-                            json.dumps(btns) if btns else None
-                        ))
-                    if batch:
-                        sql_ins = """
-                            INSERT OR IGNORE INTO messages 
-                            (account_phone, chat_id, message_id, sender_id, text, date, is_outgoing, is_read, media_type, media_metadata, buttons_json)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """
-                        await db.executemany(sql_ins, batch)
-                except Exception as c_err:
-                    logger.debug(f"Pre-caching chat {chat_id} on {clean}: {c_err}")
+                    try:
+                        msgs = await asyncio.wait_for(client.get_messages(chat_id, limit=30), timeout=4.0)
+                        batch = []
+                        for m in msgs:
+                            from app.telegram.events_dispatcher import get_media_info, extract_buttons
+                            m_type, _, meta = get_media_info(m)
+                            btns = extract_buttons(m)
+                            m_date = int(m.date.timestamp()) if m.date else int(time.time())
+                            batch.append((
+                                clean, chat_id, m.id, m.sender_id, m.text or "", m_date,
+                                1 if m.out else 0, 1 if m.out else 0, m_type,
+                                json.dumps(meta) if meta else None,
+                                json.dumps(btns) if btns else None
+                            ))
+                        if batch:
+                            sql_ins = """
+                                INSERT OR IGNORE INTO messages 
+                                (account_phone, chat_id, message_id, sender_id, text, date, is_outgoing, is_read, media_type, media_metadata, buttons_json)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """
+                            await db.executemany(sql_ins, batch)
+                    except Exception as c_err:
+                        logger.debug(f"Pre-caching chat {chat_id} on {clean}: {c_err}")
 
-                # Мягкая пауза 0.35s между чатами — безопасно для rate limit Telegram
-                await asyncio.sleep(0.35)
-            logger.info(f"[{account_phone}] Фоновый прогрев топ-{top_count} переписок завершен.")
-        except Exception as e:
-            logger.debug(f"[{account_phone}] Ошибка фонового прогрева переписок: {e}")
+                    # Мягкая пауза между чатами — безопасно для rate limit Telegram
+                    await asyncio.sleep(0.35)
+                logger.info(f"[{account_phone}] Фоновый прогрев топ-{top_count} переписок завершен.")
+            except Exception as e:
+                logger.debug(f"[{account_phone}] Ошибка фонового прогрева переписок: {e}")
 
     # ==================== АВТОРИЗАЦИЯ ПО НОМЕРУ ТЕЛЕФОНА ====================
 

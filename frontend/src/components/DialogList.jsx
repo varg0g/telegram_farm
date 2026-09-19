@@ -1,4 +1,4 @@
-import React, { useRef } from 'react';
+import React, { useRef, useState, useEffect } from 'react';
 
 function hashColor(s) {
   if (!s) return 0;
@@ -27,6 +27,13 @@ function formatTime(ts) {
 
 import { api } from '../api';
 
+// Высота строки диалога фиксирована в CSS (.dlg-row: min-height 64px + margin-bottom 2px),
+// заголовок и превью не переносятся (white-space: nowrap) — поэтому виртуализация по
+// постоянному шагу корректна. Раньше рендерились все 200 строк сразу, и каждая тянула
+// свой HTTP-запрос за аватаркой.
+const ROW_HEIGHT = 66;
+const OVERSCAN = 6;
+
 export default function DialogList({
   accounts = [],
   dialogs,
@@ -40,9 +47,34 @@ export default function DialogList({
   selectedAccount,
   onDeleteAccount,
   onRefreshDialogs,
-  onPrefetchDialog
+  onPrefetchDialog,
+  avatarMap = {},
+  onNeedAvatars
 }) {
-  const failedAvatars = useRef(new Set());
+  const scrollRef = useRef(null);
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewportH, setViewportH] = useState(0);
+
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return undefined;
+    const handleScroll = () => setScrollTop(el.scrollTop);
+    const measure = () => setViewportH(el.clientHeight);
+    el.addEventListener('scroll', handleScroll, { passive: true });
+    measure();
+    let ro = null;
+    if (typeof ResizeObserver !== 'undefined') {
+      ro = new ResizeObserver(measure);
+      ro.observe(el);
+    } else {
+      window.addEventListener('resize', measure);
+    }
+    return () => {
+      el.removeEventListener('scroll', handleScroll);
+      if (ro) ro.disconnect(); else window.removeEventListener('resize', measure);
+    };
+  }, []);
+
   const handleGetCode = async () => {
     if (!selectedAccount) {
       alert('Сначала выберите аккаунт слева');
@@ -128,6 +160,27 @@ export default function DialogList({
     }
     return (b.top_message_date || 0) - (a.top_message_date || 0);
   });
+
+  // Окно виртуализации: рендерим только видимые строки + небольшой запас
+  const effectiveViewport = viewportH > 0 ? viewportH : 600;
+  const startIndex = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN);
+  const endIndex = Math.min(sorted.length, Math.ceil((scrollTop + effectiveViewport) / ROW_HEIGHT) + OVERSCAN);
+  const visibleRows = sorted.slice(startIndex, endIndex).map((d, i) => ({ d, index: startIndex + i }));
+
+  // Запрашиваем аватарки только для видимого окна, одним пакетным запросом
+  const visibleItems = visibleRows.map(({ d }) => `${d.account_phone}:${d.chat_id}`);
+  const visibleItemsKey = visibleItems.join(',');
+  const visibleItemsRef = useRef(visibleItems);
+  visibleItemsRef.current = visibleItems;
+  const needAvatarsRef = useRef(onNeedAvatars);
+  useEffect(() => { needAvatarsRef.current = onNeedAvatars; }, [onNeedAvatars]);
+
+  useEffect(() => {
+    const cb = needAvatarsRef.current;
+    if (!cb || !visibleItemsKey) return undefined;
+    const timer = setTimeout(() => cb(visibleItemsRef.current), 200);
+    return () => clearTimeout(timer);
+  }, [visibleItemsKey]);
 
   return (
     <section className="panel panel-dialogs">
@@ -250,81 +303,89 @@ export default function DialogList({
         </button>
       </div>
 
-      <div className="list-scroll" id="dialogList" aria-label="Диалоги">
+      <div className="list-scroll" id="dialogList" aria-label="Диалоги" ref={scrollRef}>
         {sorted.length === 0 ? (
           <div className="list-empty">
             {dialogs.length ? 'Диалоги не найдены' : 'Нет диалогов'}
           </div>
         ) : (
-          sorted.map(d => {
-            const isSelected = selectedDialog && 
-              Number(selectedDialog.chat_id) === Number(d.chat_id) && 
-              cleanPhone(selectedDialog.account_phone) === cleanPhone(d.account_phone);
-            const title = d.title || d.username || 'Без названия';
-            const colorIdx = hashColor(title);
-            const isOut = Boolean(d.top_message_is_outgoing || (d.top_message_text && d.top_message_text.startsWith('Вы: ')));
-            const preview = d.top_message_text || (d.top_message_date ? 'Сообщение' : 'Нет сообщений');
+          <div style={{ position: 'relative', height: sorted.length * ROW_HEIGHT }}>
+            {visibleRows.map(({ d, index }) => {
+              const isSelected = selectedDialog &&
+                Number(selectedDialog.chat_id) === Number(d.chat_id) &&
+                cleanPhone(selectedDialog.account_phone) === cleanPhone(d.account_phone);
+              const title = d.title || d.username || 'Без названия';
+              const colorIdx = hashColor(title);
+              const isOut = Boolean(d.top_message_is_outgoing || (d.top_message_text && d.top_message_text.startsWith('Вы: ')));
+              const preview = d.top_message_text || (d.top_message_date ? 'Сообщение' : 'Нет сообщений');
+              const avatarUrl = avatarMap[`${d.account_phone}_${d.chat_id}`] || null;
 
-            return (
-              <a
-                key={`${d.account_phone}_${d.chat_id}`}
-                href="#"
-                className={`dlg-row ${isSelected ? 'active' : ''}`}
-                onClick={(e) => {
-                  e.preventDefault();
-                  setSelectedDialog(d);
-                }}
-              >
-                <span className={`av av-md av-${colorIdx}`} style={{ position: 'relative' }}>
-                  {!failedAvatars.current.has(`${d.account_phone}_${d.chat_id}`) && (
-                    <img
-                      src={`/api/avatar?account=${encodeURIComponent(d.account_phone)}&chat_id=${d.chat_id}`}
-                      alt=""
-                      loading="lazy"
-                      onError={(e) => {
-                        failedAvatars.current.add(`${d.account_phone}_${d.chat_id}`);
-                        e.target.style.display = 'none';
-                      }}
-                    />
-                  )}
-                  <span>{(title[0] || '?').toUpperCase()}</span>
-                  {d.is_online && <span className="online-dot" title="В сети"></span>}
-                </span>
-
-                <span className="dlg-mid">
-                  <span className="dlg-title">
-                    {title}
-                    {d.is_pinned && !isGlobalView ? (
-                      <svg className="svg-ico pinned-ico" viewBox="0 0 24 24" aria-hidden="true" style={{ marginLeft: '4px', opacity: 0.6, width: '13px', height: '13px' }}>
-                        <path d="M16 3H8l-1 9 2 2v6l3 2 3-2v-6l2-2-1-9z"></path>
-                      </svg>
-                    ) : null}
-                  </span>
-                  <span className="dlg-preview">
-                    {isOut && <span className="dlg-prefix">Вы: </span>}
-                    {preview.replace(/^Вы:\s*/, '')}
-                  </span>
-                </span>
-
-                <span className="dlg-side">
-                  <span className="dlg-time">{formatTime(d.top_message_date)}</span>
-                  <span className="dlg-side-bottom">
-                    {isOut && (
-                      <span
-                        className={`dlg-tick ${d.top_message_is_read ? 'out-read' : 'out-sent'}`}
-                        title={d.top_message_is_read ? 'Прочитано' : 'Отправлено'}
-                      >
-                        {d.top_message_is_read ? '✓✓' : '✓'}
-                      </span>
+              return (
+                <a
+                  key={`${d.account_phone}_${d.chat_id}`}
+                  href="#"
+                  className={`dlg-row ${isSelected ? 'active' : ''}`}
+                  style={{
+                    position: 'absolute',
+                    top: index * ROW_HEIGHT,
+                    left: 0,
+                    right: 0,
+                    height: ROW_HEIGHT - 2,
+                    marginBottom: 0
+                  }}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    setSelectedDialog(d);
+                  }}
+                >
+                  <span className={`av av-md av-${colorIdx}`} style={{ position: 'relative' }}>
+                    {avatarUrl && (
+                      <img
+                        src={avatarUrl}
+                        alt=""
+                        loading="lazy"
+                        onError={(e) => { e.target.style.display = 'none'; }}
+                      />
                     )}
-                    {d.unread_count > 0 && (
-                      <span className="unread">{d.unread_count > 99 ? '99+' : d.unread_count}</span>
-                    )}
+                    <span>{(title[0] || '?').toUpperCase()}</span>
+                    {d.is_online && <span className="online-dot" title="В сети"></span>}
                   </span>
-                </span>
-              </a>
-            );
-          })
+
+                  <span className="dlg-mid">
+                    <span className="dlg-title">
+                      {title}
+                      {d.is_pinned && !isGlobalView ? (
+                        <svg className="svg-ico pinned-ico" viewBox="0 0 24 24" aria-hidden="true" style={{ marginLeft: '4px', opacity: 0.6, width: '13px', height: '13px' }}>
+                          <path d="M16 3H8l-1 9 2 2v6l3 2 3-2v-6l2-2-1-9z"></path>
+                        </svg>
+                      ) : null}
+                    </span>
+                    <span className="dlg-preview">
+                      {isOut && <span className="dlg-prefix">Вы: </span>}
+                      {preview.replace(/^Вы:\s*/, '')}
+                    </span>
+                  </span>
+
+                  <span className="dlg-side">
+                    <span className="dlg-time">{formatTime(d.top_message_date)}</span>
+                    <span className="dlg-side-bottom">
+                      {isOut && (
+                        <span
+                          className={`dlg-tick ${d.top_message_is_read ? 'out-read' : 'out-sent'}`}
+                          title={d.top_message_is_read ? 'Прочитано' : 'Отправлено'}
+                        >
+                          {d.top_message_is_read ? '✓✓' : '✓'}
+                        </span>
+                      )}
+                      {d.unread_count > 0 && (
+                        <span className="unread">{d.unread_count > 99 ? '99+' : d.unread_count}</span>
+                      )}
+                    </span>
+                  </span>
+                </a>
+              );
+            })}
+          </div>
         )}
       </div>
     </section>

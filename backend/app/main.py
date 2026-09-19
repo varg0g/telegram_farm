@@ -30,13 +30,22 @@ async def lifespan(app: FastAPI):
     await db.start()
     await init_schema()
 
-    # 2. Фоновый запуск ранее активных сессий
+    # 2. Индекс медиафайлов строится один раз на старте (в отдельном потоке),
+    #    чтобы поиск в кэше был O(1) и не блокировал event loop через glob().
+    from app.api.media import ensure_media_index
+    await ensure_media_index()
+
+    # 3. Единственный супервизор соединений вместо разрозненных reconnect-задач
+    await client_manager.start_supervisor()
+
+    # 4. Фоновый запуск ранее активных сессий
     asyncio.create_task(_auto_start_accounts())
 
     yield
 
     # Корректное завершение
     logger.info("Остановка приложения и сохранение состояния...")
+    await client_manager.stop_supervisor()
     await db.stop()
 
 async def _auto_start_accounts():
@@ -81,8 +90,9 @@ app.include_router(tools_router)
 app.include_router(ws_router)
 app.include_router(media_router)
 
-from app.api.dialogs import api_get_avatar
+from app.api.dialogs import api_get_avatar, api_get_avatars_bulk
 app.add_api_route("/api/avatar", api_get_avatar, methods=["GET"])
+app.add_api_route("/api/avatars", api_get_avatars_bulk, methods=["GET"])
 
 # Раздача медиафайлов и аватарок
 app.mount("/data", StaticFiles(directory=DATA_DIR), name="data")

@@ -36,6 +36,8 @@ export const api = {
     body: JSON.stringify({ phone, code, password })
   }),
   startAccount: (name) => request(`/api/accounts/${encodeURIComponent(name)}/start`, { method: 'POST' }),
+  precacheAccount: (name, topCount = 20) =>
+    request(`/api/accounts/${encodeURIComponent(name)}/precache?top_count=${topCount}`, { method: 'POST' }),
   bindProxy: (name, proxy_id) => request(`/api/accounts/${encodeURIComponent(name)}/bind-proxy`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -70,6 +72,11 @@ export const api = {
   getDialogMedia: (account_phone, chat_id, kind = 'media', limit = 18, signal = null) =>
     request(`/api/dialogs/${encodeURIComponent(account_phone)}/${chat_id}/media?kind=${kind}&limit=${limit}`, { signal }),
   markRead: (account_phone, chat_id) => request(`/api/dialogs/${encodeURIComponent(account_phone)}/${chat_id}/read`, { method: 'POST' }),
+
+  // Пакетный резолвер аватарок: один запрос на всё видимое окно списка диалогов
+  // вместо отдельного запроса от каждой строки.
+  getAvatars: (items, download = 16) =>
+    request(`/api/avatars?items=${encodeURIComponent(items)}&download=${download}`),
 
   // Сообщения
   getMessages: (account_phone, chat_id, limit = 60, offset_id = 0, signal = null) =>

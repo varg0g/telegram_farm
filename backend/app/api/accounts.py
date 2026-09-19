@@ -187,6 +187,15 @@ async def api_start_account(name: str):
         raise HTTPException(status_code=400, detail=msg)
     return {"status": "ok", "message": msg}
 
+@router.post("/{name}/precache")
+async def api_precache_account(name: str, top_count: int = Query(20, ge=1, le=100)):
+    """
+    Прогрев истории топ-диалогов конкретного (выбранного в UI) аккаунта.
+    Вызывается фронтендом при выборе аккаунта вместо массового прогрева всех сессий на старте.
+    """
+    started = await client_manager.precache_account(name, top_count=top_count)
+    return {"status": "ok" if started else "skipped", "started": started}
+
 @router.post("/{name}/bind-proxy")
 async def api_bind_proxy(name: str, req: BindProxyRequest):
     await bind_proxy_to_account(name, req.proxy_id)
